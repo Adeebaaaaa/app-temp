@@ -1,0 +1,200 @@
+name: 01 - Pre Deploy Env (Version → Build → Scan)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+
+jobs:
+#--------------------------VERSION INCREMENT + GIT TAG-------------------------------------
+  versioning:
+    name: Increment Version & Create Git Tag
+    runs-on: ubuntu-latest
+
+    outputs:
+      app_version: ${{ steps.version.outputs.app_version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+
+      - name: Auto-increment patch version
+        id: version
+        run: |
+          RELEASE_VERSION=$(cat version.txt)
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$RELEASE_VERSION"
+          PATCH=$((PATCH + 1))
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+
+          echo "$NEW_VERSION" > version.txt
+          echo "app_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+          git add version.txt
+          git commit -m "chore: bump version to v$NEW_VERSION"
+          git push origin HEAD
+
+      - name: Create semantic git tag
+        run: |
+          VERSION=${{ steps.version.outputs.app_version }}
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+#---------------------------- BUILD & PUSH DOCKER IMAGE---------------------------------
+  build-image:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: versioning
+
+    outputs:
+      image_version: ${{ steps.image.outputs.image_version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -------- BEFORE_SCRIPT (GitLab parity) --------
+      - name: Verify Docker
+        run: docker version
+
+      - name: Install AWS CLI & Git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli git
+
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws configure set region "${{ secrets.AWS_REGION }}"
+
+      - name: Login to ECR
+        run: |
+          ECR_REGISTRY=$(echo "$REGISTRY_URL" | cut -d/ -f1)
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Enable Docker buildx
+        run: docker buildx create --use
+
+      # -------- SCRIPT (GitLab parity) --------
+      - name: Prepare version metadata
+        id: image
+        run: |
+          touch version.sh
+          chmod 755 version.sh
+
+          APP_VERSION=${{ needs.versioning.outputs.app_version }}
+          CONTAINER_VERSION=${GITHUB_SHA}
+          IMAGE_VERSION="${APP_VERSION}_${CONTAINER_VERSION}"
+
+          echo "APP_VERSION=${APP_VERSION}" > version.sh
+          echo "CONTAINER_VERSION=${CONTAINER_VERSION}" >> version.sh
+          echo "IMAGE_VERSION=${IMAGE_VERSION}" >> version.sh
+
+          echo "image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+          cat version.sh
+
+      - name: Clone source repo
+        run: |
+          git clone https://github.com/binblee/springboot-helm-chart.git
+          cd springboot-helm-chart/demoweb
+
+          awk '
+          BEGIN { inserted=0 }
+          /^FROM/ && inserted==0 {
+            print
+            print "RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*"
+            inserted=1
+            next
+          }
+          { print }
+          ' Dockerfile > Dockerfile.ci
+
+          grep -n "apt-get install -y curl" Dockerfile.ci
+
+          docker buildx build \
+            --file Dockerfile.ci \
+            --tag "$REGISTRY_URL:${{ steps.image.outputs.image_version }}" \
+            --push .
+
+      - name: Export image reference
+        run: |
+          echo "DOCKER_IMAGE_TO_SCAN=$REGISTRY_URL:${{ steps.image.outputs.image_version }}" >> $GITHUB_ENV
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metadata
+          path: |
+            version.sh
+
+# ------------------------POST BUILD SCAN-------------------------------------------
+  post-build-scan:
+    name: Post Build Image Scan
+    runs-on: ubuntu-latest
+    needs: build-image
+
+    steps:
+      - name: Verify Docker
+        run: docker version
+
+      - name: Install AWS CLI & Git
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y awscli git
+
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
+          aws configure set region "${{ secrets.AWS_REGION }}"
+
+      - name: Login to ECR
+        run: |
+          ECR_REGISTRY=$(echo "$REGISTRY_URL" | cut -d/ -f1)
+          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
+            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+      - name: Run Trivy scan
+        run: |
+          IMAGE="$REGISTRY_URL:${{ needs.build-image.outputs.image_version }}"
+          echo "Scanning image $IMAGE"
+
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            "$IMAGE"
+
+#--------------------------------RELEASE (PROMOTION ANCHOR)--------------------------------------------
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:  build-image
+
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.versioning.outputs.app_version }}
+          name: Release v${{ needs.versioning.outputs.app_version }}
+          body: |
+            Image:
+              ${{ env.REGISTRY_URL }}:${{ needs.build-image.outputs.image_version }}
+
+            Commit SHA:
+              ${{ github.sha }}

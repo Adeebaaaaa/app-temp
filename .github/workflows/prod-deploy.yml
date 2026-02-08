@@ -1,0 +1,181 @@
+name:  Deploy to PROD
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to deploy to PROD (e.g. 1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+# ------------------------------------------------------------
+# UNIVERSAL ENV (reused everywhere)
+# ------------------------------------------------------------
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+  EKS_CLUSTER_NAME: prod-cluster-name
+  PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+
+jobs:
+# ============================================================
+# JOB 1: PRE-DEPLOY PROD SLO / SLA CAPTURE (NON-BLOCKING)
+# ============================================================
+  prod-pre-deploy-validation:
+    name: PROD Pre-Deploy SLO/SLA Capture
+    runs-on: ubuntu-latest
+    container:
+      image: miradeeba766/app-test:latest
+    continue-on-error: true
+
+    steps:
+      - name: Verify BETA deployment completed
+        run: |
+          NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          echo "$NOTES" | grep "BETA_DEPLOYED=true"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capture PRE-deploy PROD SLO/SLA baseline
+        run: |
+          echo "Capturing PRE-deploy PROD SLO/SLA baseline"
+
+          RELEASE_VERSION="v${{ inputs.version }}"
+          CAPTURE_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          carpenter capture \
+            --environment prod \
+            --service hub-dashboard \
+            --release "$RELEASE_VERSION" \
+            --phase pre-deploy \
+            --timestamp "$CAPTURE_TIME"
+
+# ============================================================
+# JOB 2: DEPLOY TO PROD (MANUAL + ENV PROTECTION)
+# ============================================================
+  deploy-prod:
+    name: Deploy to PROD
+    runs-on: ubuntu-latest
+    needs: prod-pre-deploy-validation
+    environment: prod
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Verify BETA deployment completed (hard gate)
+        run: |
+          NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          echo "$NOTES" | grep "BETA_DEPLOYED=true"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image from release
+        id: image
+        run: |
+          BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          IMAGE=$(echo "$BODY" | grep "${REGISTRY_URL}" | awk '{print $1}')
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set region "$AWS_REGION"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Helm deploy to PROD
+        run: |
+          IMAGE="${{ steps.image.outputs.image }}"
+          IMAGE_REPO=$(echo "$IMAGE" | cut -d: -f1)
+          IMAGE_TAG=$(echo "$IMAGE" | cut -d: -f2)
+
+          helm upgrade --install springboot ./helm \
+            --namespace default \
+            --create-namespace \
+            --set image.repository="$IMAGE_REPO" \
+            --set image.tag="$IMAGE_TAG"
+
+# ============================================================
+# JOB 3: POST-DEPLOY PROD VALIDATION (BLOCKING)
+# ============================================================
+  prod-post-deploy-validation:
+    name: PROD Post-Deploy Validation
+    runs-on: ubuntu-latest
+    needs: deploy-prod
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Wait for PROD readiness
+        run: |
+          for i in {1..10}; do
+            curl -f "$PROD_BASE_URL/health" && break
+            sleep 10
+          done
+
+      - name: Run controlled performance tests
+        run: |
+          chmod +x performance/run-prod-perf-tests.sh
+          ./performance/run-prod-perf-tests.sh
+
+      - name: Capture POST-deploy PROD SLO/SLA
+        run: |
+          RELEASE_VERSION="v${{ inputs.version }}"
+          CAPTURE_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          carpenter capture \
+            --environment prod \
+            --service hub-dashboard \
+            --release "$RELEASE_VERSION" \
+            --phase post-deploy \
+            --timestamp "$CAPTURE_TIME"
+
+      - name: Compare PRE vs POST deploy SLO/SLA
+        run: |
+          carpenter compare \
+            --environment prod \
+            --service hub-dashboard \
+            --release "v${{ inputs.version }}" \
+            --fail-on-regression \
+            --latency-threshold 10 \
+            --error-rate-threshold 0.5 \
+            --availability-threshold 99.9
+
+# ============================================================
+# JOB 4: MARK RELEASE + NOTIFY
+# ============================================================
+  notify-prod:
+    name: Notify PROD Deployment
+    runs-on: ubuntu-latest
+    needs: prod-post-deploy-validation
+    if: success()
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Mark release as PROD deployed
+        run: |
+          gh release edit v${{ inputs.version }} \
+            --notes "$(gh release view v${{ inputs.version }} --json body --jq '.body')
+            PROD_DEPLOYED=true"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send PROD notification
+        run: |
+          curl -X POST "${{ secrets.PROD_WEBHOOK_ID }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"PROD deployment successful 🚀\nVersion: v${{ inputs.version }}\"
+            }"

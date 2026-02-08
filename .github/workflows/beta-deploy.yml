@@ -1,0 +1,148 @@
+name:  Deploy to BETA
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version to deploy to BETA (e.g. 1.2.3)"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-1
+  REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
+  EKS_CLUSTER_NAME: beta-cluster-name
+  BASE_URL: ${{ secrets.BETA_BASE_URL }}
+
+jobs:
+  deploy-beta:
+    name: Deploy to BETA
+    runs-on: ubuntu-latest
+    environment: beta
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Verify DEV deployment completed
+        run: |
+            NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+            echo "$NOTES" | grep "DEV_DEPLOYED=true"
+        env:
+            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Verify DEV deployment completed
+        run: |
+          NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          echo "$NOTES" | grep "DEV_DEPLOYED=true"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image from release
+        id: image
+        run: |
+          BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          IMAGE=$(echo "$BODY" | grep "${REGISTRY_URL}" | awk '{print $1}')
+          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure AWS
+        run: |
+          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
+          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
+          aws configure set region "$AWS_REGION"
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig \
+            --region "$AWS_REGION" \
+            --name "$EKS_CLUSTER_NAME"
+
+      - name: Helm deploy to BETA
+        run: |
+          IMAGE="${{ steps.image.outputs.image }}"
+          IMAGE_REPO=$(echo "$IMAGE" | cut -d: -f1)
+          IMAGE_TAG=$(echo "$IMAGE" | cut -d: -f2)
+
+          helm upgrade --install springboot ./helm \
+            --namespace default \
+            --create-namespace \
+            --set image.repository="$IMAGE_REPO" \
+            --set image.tag="$IMAGE_TAG"
+
+      - name: Verify BETA deployment
+        run: |
+          kubectl get deployments -n default
+          kubectl get pods -n default
+          kubectl get svc -n default
+          kubectl get nodes
+          kubectl get events -n default --sort-by=.lastTimestamp | tail -20
+
+# ============================================================
+# JOB 2: POST DEPLOY BETA TESTS
+# ============================================================
+  post-deploy-beta-tests:
+    name: Post Deploy BETA Tests
+    runs-on: ubuntu-latest
+    needs: deploy-beta
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Wait for application readiness
+        run: |
+          for i in {1..10}; do
+            curl -f "$BASE_URL/" && break
+            echo "App not ready yet... retrying"
+            sleep 10
+          done
+
+      - name: Run E2E tests
+        run: |
+          chmod +x tests/e2e/run-e2e-tests.sh
+          ./tests/e2e/run-e2e-tests.sh
+
+      - name: Run DAST scan
+        run: |
+          chmod +x security/dast/run-dast.sh
+          ./security/dast/run-dast.sh "$BASE_URL/"
+
+      - name: Run performance tests
+        run: |
+          chmod +x performance/run-perf-tests.sh
+          ./performance/run-perf-tests.sh
+
+# ============================================================
+# JOB 3: MARK RELEASE + NOTIFY
+# ============================================================
+  notify-beta:
+    name: Notify BETA Deployment
+    runs-on: ubuntu-latest
+    needs: post-deploy-beta-tests
+    if: success()
+    container:
+      image: miradeeba766/app-test:latest
+
+    steps:
+      - name: Mark release as BETA deployed
+        run: |
+          gh release edit v${{ inputs.version }} \
+            --notes "$(gh release view v${{ inputs.version }} --json body --jq '.body')
+            BETA_DEPLOYED=true"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send BETA notification
+        run: |
+          curl -X POST "${{ secrets.BETA_WEBHOOK_ID }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"BETA deployment successful 🚀\nVersion: v${{ inputs.version }}\"
+            }"
