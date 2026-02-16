@@ -1,4 +1,4 @@
-name:  Deploy to PROD
+name: Deploy to PROD
 
 on:
   workflow_dispatch:
@@ -8,42 +8,30 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
 
-# ------------------------------------------------------------
-# UNIVERSAL ENV (reused everywhere)
-# ------------------------------------------------------------
 env:
-  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   AWS_REGION: us-east-1
   REGISTRY_URL: ${{ secrets.REGISTRY_URL }}
   EKS_CLUSTER_NAME: prod-cluster-name
   PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
 
 jobs:
-# ============================================================
-# JOB 1: PRE-DEPLOY PROD SLO / SLA CAPTURE (NON-BLOCKING)
-# ============================================================
   prod-pre-deploy-validation:
     name: PROD Pre-Deploy SLO/SLA Capture
     runs-on: ubuntu-latest
-    container:
-      image: miradeeba766/app-test:latest
     continue-on-error: true
 
     steps:
       - name: Verify BETA deployment completed
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
           echo "$NOTES" | grep "BETA_DEPLOYED=true"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Capture PRE-deploy PROD SLO/SLA baseline
         run: |
-          echo "Capturing PRE-deploy PROD SLO/SLA baseline"
-
           RELEASE_VERSION="v${{ inputs.version }}"
           CAPTURE_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -54,39 +42,43 @@ jobs:
             --phase pre-deploy \
             --timestamp "$CAPTURE_TIME"
 
-# ============================================================
-# JOB 2: DEPLOY TO PROD (MANUAL + ENV PROTECTION)
-# ============================================================
+
   deploy-prod:
     name: Deploy to PROD
     runs-on: ubuntu-latest
     needs: prod-pre-deploy-validation
     environment: prod
-    container:
-      image: miradeeba766/app-test:latest
 
     steps:
       - name: Verify BETA deployment completed (hard gate)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           NOTES=$(gh release view v${{ inputs.version }} --json body --jq '.body')
           echo "$NOTES" | grep "BETA_DEPLOYED=true"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract image from release
         id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
-          IMAGE=$(echo "$BODY" | grep "${REGISTRY_URL}" | awk '{print $1}')
+          IMAGE=$(echo "$BODY" | grep -m1 "${REGISTRY_URL}")
           echo "image=$IMAGE" >> $GITHUB_OUTPUT
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "Deploying image: $IMAGE"
 
-      - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "$AWS_ACCESS_KEY_ID"
-          aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY"
-          aws configure set region "$AWS_REGION"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
 
       - name: Update kubeconfig
         run: |
@@ -106,15 +98,10 @@ jobs:
             --set image.repository="$IMAGE_REPO" \
             --set image.tag="$IMAGE_TAG"
 
-# ============================================================
-# JOB 3: POST-DEPLOY PROD VALIDATION (BLOCKING)
-# ============================================================
   prod-post-deploy-validation:
     name: PROD Post-Deploy Validation
     runs-on: ubuntu-latest
     needs: deploy-prod
-    container:
-      image: miradeeba766/app-test:latest
 
     steps:
       - name: Wait for PROD readiness
@@ -152,30 +139,29 @@ jobs:
             --error-rate-threshold 0.5 \
             --availability-threshold 99.9
 
-# ============================================================
-# JOB 4: MARK RELEASE + NOTIFY
-# ============================================================
+
   notify-prod:
     name: Notify PROD Deployment
     runs-on: ubuntu-latest
     needs: prod-post-deploy-validation
     if: success()
-    container:
-      image: miradeeba766/app-test:latest
 
     steps:
       - name: Mark release as PROD deployed
-        run: |
-          gh release edit v${{ inputs.version }} \
-            --notes "$(gh release view v${{ inputs.version }} --json body --jq '.body')
-            PROD_DEPLOYED=true"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+
+          if echo "$BODY" | grep -q "PROD_DEPLOYED=true"; then
+            echo "PROD already marked."
+          else
+            gh release edit v${{ inputs.version }} --notes "$BODY
+            PROD_DEPLOYED=true"
+          fi
 
       - name: Send PROD notification
         run: |
           curl -X POST "${{ secrets.PROD_WEBHOOK_ID }}" \
             -H "Content-Type: application/json" \
-            -d "{
-              \"text\": \"PROD deployment successful 🚀\nVersion: v${{ inputs.version }}\"
-            }"
+            -d "{\"text\":\"PROD deployment successful  Version: v${{ inputs.version }}\"}"

@@ -8,7 +8,7 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -89,14 +89,7 @@ jobs:
           kubectl get svc -n default
           kubectl get nodes
           kubectl get events -n default --sort-by=.lastTimestamp | tail -20
-      - name: Mark release as DEV deployed
-        run: |
-            gh release edit v${{ inputs.version }} \
-            --notes "$(gh release view v${{ inputs.version }} --json body --jq '.body')
-            DEV_DEPLOYED=true"
-            env:
-            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+      
   post-deploy-tests:
     name: Post Deploy DEV Tests
     runs-on: ubuntu-latest
@@ -144,8 +137,13 @@ jobs:
          GH_TOKEN: ${{ github.token }}
         run: |
           BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
-          gh release edit v${{ inputs.version }} --notes "$BODY
-          DEV_DEPLOYED=true"
+
+            if echo "$BODY" | grep -q "DEV_DEPLOYED=true"; then
+              echo "DEV already marked."
+            else
+              gh release edit v${{ inputs.version }} --notes "$BODY
+              DEV_DEPLOYED=true"
+            fi
 
       - name: Send Google Chat notification
         run: |
