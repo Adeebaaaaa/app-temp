@@ -140,12 +140,13 @@ jobs:
 
     steps: 
       - name: Mark release as DEV deployed
+        env:
+         GH_TOKEN: ${{ github.token }}
         run: |
-            gh release edit v${{ inputs.version }} \
-            --notes "$(gh release view v${{ inputs.version }} --json body --jq '.body')
-            DEV_DEPLOYED=true"
-            env:
-            GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY=$(gh release view v${{ inputs.version }} --json body --jq '.body')
+          gh release edit v${{ inputs.version }} --notes "$BODY
+          DEV_DEPLOYED=true"
+
       - name: Send Google Chat notification
         run: |
           curl -X POST "${{ secrets.DEV_WEBHOOK_ID }}" \
