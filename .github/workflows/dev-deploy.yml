@@ -104,11 +104,6 @@ jobs:
       - name: Debug BASE_URL
         run: |
           echo "BASE_URL is: $BASE_URL"
-      - name: Debug BASE_URL raw
-        run: |
-         echo "Length: ${#BASE_URL}"
-         printf '%q\n' "$BASE_URL"
-
 
       - name: Wait for app readiness
         run: |
