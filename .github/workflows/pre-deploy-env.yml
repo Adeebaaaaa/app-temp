@@ -1,4 +1,4 @@
-name: 01 - Pre Deploy Env (Version → Build → Scan)
+name: 01 - Pre Deploy Env 
 
 on:
   workflow_dispatch:
