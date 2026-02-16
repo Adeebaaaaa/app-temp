@@ -105,6 +105,9 @@ jobs:
     if: success()
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Mark release as BETA deployed
         env:
           GH_TOKEN: ${{ github.token }}
