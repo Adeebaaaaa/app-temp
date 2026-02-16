@@ -1,4 +1,4 @@
-name: 01 - Pre Deploy Env 
+name: Pre Deploy Env 
 
 on:
   workflow_dispatch:
@@ -64,84 +64,76 @@ jobs:
       image_version: ${{ steps.image.outputs.image_version }}
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      # -------- BEFORE_SCRIPT (GitLab parity) --------
-      - name: Verify Docker
-        run: docker version
+    - name: Verify Docker
+      run: docker version
 
-      - name: Install AWS CLI & Git
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli git
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          aws configure set region "${{ secrets.AWS_REGION }}"
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Login to ECR
-        run: |
-          ECR_REGISTRY=$(echo "$REGISTRY_URL" | cut -d/ -f1)
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - name: Enable Docker buildx
+      run: docker buildx create --use
 
-      - name: Enable Docker buildx
-        run: docker buildx create --use
+    - name: Prepare version metadata
+      id: image
+      run: |
+        touch version.sh
+        chmod 755 version.sh
 
-      # -------- SCRIPT (GitLab parity) --------
-      - name: Prepare version metadata
-        id: image
-        run: |
-          touch version.sh
-          chmod 755 version.sh
+        APP_VERSION=${{ needs.versioning.outputs.app_version }}
+        CONTAINER_VERSION=${GITHUB_SHA}
+        IMAGE_VERSION="${APP_VERSION}_${CONTAINER_VERSION}"
 
-          APP_VERSION=${{ needs.versioning.outputs.app_version }}
-          CONTAINER_VERSION=${GITHUB_SHA}
-          IMAGE_VERSION="${APP_VERSION}_${CONTAINER_VERSION}"
+        echo "APP_VERSION=${APP_VERSION}" > version.sh
+        echo "CONTAINER_VERSION=${CONTAINER_VERSION}" >> version.sh
+        echo "IMAGE_VERSION=${IMAGE_VERSION}" >> version.sh
 
-          echo "APP_VERSION=${APP_VERSION}" > version.sh
-          echo "CONTAINER_VERSION=${CONTAINER_VERSION}" >> version.sh
-          echo "IMAGE_VERSION=${IMAGE_VERSION}" >> version.sh
+        echo "image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
+        cat version.sh
 
-          echo "image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
-          cat version.sh
+    - name: Build & Push Docker image
+      run: |
+        git clone https://github.com/binblee/springboot-helm-chart.git
+        cd springboot-helm-chart/demoweb
 
-      - name: Clone source repo
-        run: |
-          git clone https://github.com/binblee/springboot-helm-chart.git
-          cd springboot-helm-chart/demoweb
+        awk '
+        BEGIN { inserted=0 }
+        /^FROM/ && inserted==0 {
+          print
+          print "RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*"
+          inserted=1
+          next
+        }
+        { print }
+        ' Dockerfile > Dockerfile.ci
 
-          awk '
-          BEGIN { inserted=0 }
-          /^FROM/ && inserted==0 {
-            print
-            print "RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*"
-            inserted=1
-            next
-          }
-          { print }
-          ' Dockerfile > Dockerfile.ci
+        grep -n "apt-get install -y curl" Dockerfile.ci
 
-          grep -n "apt-get install -y curl" Dockerfile.ci
+        docker buildx build \
+          --file Dockerfile.ci \
+          --tag "${{ secrets.REGISTRY_URL }}:${{ steps.image.outputs.image_version }}" \
+          --push .
 
-          docker buildx build \
-            --file Dockerfile.ci \
-            --tag "$REGISTRY_URL:${{ steps.image.outputs.image_version }}" \
-            --push .
+    - name: Export image reference
+      run: |
+        echo "DOCKER_IMAGE_TO_SCAN=${{ secrets.REGISTRY_URL }}:${{ steps.image.outputs.image_version }}" >> $GITHUB_ENV
 
-      - name: Export image reference
-        run: |
-          echo "DOCKER_IMAGE_TO_SCAN=$REGISTRY_URL:${{ steps.image.outputs.image_version }}" >> $GITHUB_ENV
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-metadata
+        path: version.sh
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-metadata
-          path: |
-            version.sh
+  
 
 # ------------------------POST BUILD SCAN-------------------------------------------
   post-build-scan:
