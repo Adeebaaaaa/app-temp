@@ -142,51 +142,47 @@ jobs:
     needs: build-image
 
     steps:
-      - name: Verify Docker
-        run: docker version
+    - name: Checkout code
+      uses: actions/checkout@v4
 
-      - name: Install AWS CLI & Git
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y awscli git
+    - name: Verify Docker
+      run: docker version
 
-      - name: Configure AWS
-        run: |
-          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}"
-          aws configure set region "${{ secrets.AWS_REGION }}"
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Login to ECR
-        run: |
-          ECR_REGISTRY=$(echo "$REGISTRY_URL" | cut -d/ -f1)
-          aws ecr get-login-password --region ${{ secrets.AWS_REGION }} \
-            | docker login --username AWS --password-stdin "$ECR_REGISTRY"
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Run Trivy scan
-        run: |
-          IMAGE="$REGISTRY_URL:${{ needs.build-image.outputs.image_version }}"
-          echo "Scanning image $IMAGE"
+    - name: Install Trivy
+      uses: aquasecurity/trivy-action@0.20.0
+      with:
+        scan-type: image
+        image-ref: "${{ secrets.REGISTRY_URL }}:${{ needs.build-image.outputs.image_version }}"
+        severity: "CRITICAL,HIGH"
+        exit-code: "1"
 
-          trivy image \
-            --severity CRITICAL,HIGH \
-            --exit-code 1 \
-            "$IMAGE"
 
 #--------------------------------RELEASE (PROMOTION ANCHOR)--------------------------------------------
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs:  build-image
-
+    needs:
+      - versioning
+      - build-image
     steps:
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ needs.versioning.outputs.app_version }}
-          name: Release v${{ needs.versioning.outputs.app_version }}
-          body: |
-            Image:
-              ${{ env.REGISTRY_URL }}:${{ needs.build-image.outputs.image_version }}
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: v${{ needs.versioning.outputs.app_version }}
+        name: Release v${{ needs.versioning.outputs.app_version }}
+        body: |
+          Image:
+            ${{ secrets.REGISTRY_URL }}:${{ needs.build-image.outputs.image_version }}
 
-            Commit SHA:
-              ${{ github.sha }}
+          Commit SHA:
+            ${{ github.sha }}
