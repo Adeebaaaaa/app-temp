@@ -1,4 +1,4 @@
-#  CI/CD Pipeline – GitHub Actions (Build Once, Promote Safely)
+#  CI/CD Pipeline – GitHub Actions 
 
 ##  Overview
 
