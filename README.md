@@ -2,7 +2,6 @@
 
 ##  Overview
 
-This repository implements a **build-once, promote-many** CI/CD pipeline using **GitHub Actions**, **AWS EKS**, **Helm**, and **Amazon ECR**.
 
 The pipeline guarantees:
 
@@ -22,25 +21,25 @@ This design intentionally prevents:
 
 ##  Core Design Principles
 
-### 1️⃣ Build Once, Version Once
+###  Build Once, Version Once
 - Application is built only **one time**
 - A semantic version (`vX.Y.Z`) is generated
 - Docker image is tagged with:
   - semantic version
   - commit SHA
 
-### 2️⃣ Promote, Don’t Rebuild
+###  Promote, Don’t Rebuild
 - DEV, BETA, and PROD reuse the **same Docker image**
 - No environment-specific rebuilds
 - No mutable tags like `latest`
 
-### 3️⃣ GitHub Release = Promotion Anchor
+###  GitHub Release = Promotion Anchor
 GitHub Releases act as the **single source of truth** and store:
 - Docker image reference
 - Commit SHA
 - Promotion status (DEV/BETA/PROD)
 
-### 4️⃣ Hard Environment Ordering
+###  Hard Environment Ordering
 Promotion order is strictly enforced:
 ```
 Pre-Deploy → DEV → BETA → PROD
@@ -50,19 +49,19 @@ Each environment validates that the **previous environment** was successfully de
 
 ---
 
-## 🗂 Workflow Structure
+##  Workflow Structure
 ```
 .github/workflows/
 │
-├── 01-pre-deploy-env.yml
-├── 02-deploy-dev.yml
-├── 03-deploy-beta.yml
-└── 04-deploy-prod.yml
+├── pre-deploy-env.yml
+├── deploy-dev.yml
+├── deploy-beta.yml
+└── deploy-prod.yml
 ```
 
 ---
 
-## 🔁 Promotion Flow
+##  Promotion Flow
 
 ```
 pre-deploy-env
@@ -79,11 +78,11 @@ deploy-prod → checks BETA, marks PROD_DEPLOYED=true
 
 ---
 
-## 📄 Workflow Details
+##  Workflow Details
 
 ---
 
-## 01️⃣ Pre-Deploy Environment  
+##  Pre-Deploy Environment  
 **`pre-deploy-env.yml`**
 
 **Trigger:** Manual  
@@ -117,7 +116,7 @@ deploy-prod → checks BETA, marks PROD_DEPLOYED=true
 
 ---
 
-## 02️⃣ Deploy to DEV  
+##  Deploy to DEV  
 **`deploy-dev.yml`**
 
 **Trigger:** Manual  
@@ -133,7 +132,7 @@ deploy-prod → checks BETA, marks PROD_DEPLOYED=true
 - Sends DEV deployment notification
 
 ---
-## 03️⃣ Deploy to BETA  
+##  Deploy to BETA  
 **`deploy-beta.yml`**
 
 **Trigger:** Manual  
@@ -159,7 +158,7 @@ BETA_DEPLOYED=true
 
 ---
 
-## 04️⃣ Deploy to PROD  
+##  Deploy to PROD  
 **`deploy-prod.yml`**
 
 **Trigger:** Manual  

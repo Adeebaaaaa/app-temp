@@ -155,5 +155,5 @@ jobs:
         curl -X POST "${{ vars.DEV_WEBHOOK_ID }}" \
           -H "Content-Type: application/json" \
           -d "{
-            \"text\": \"DEV deployment successful 🚀\nVersion: v${{ inputs.version }}\"
+            \"text\": \"DEV deployment successful \nVersion: v${{ inputs.version }}\"
           }"
